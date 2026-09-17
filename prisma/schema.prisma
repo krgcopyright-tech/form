@@ -1,0 +1,45 @@
+// Prisma schema file for Erbil Polytechnic University MIS Student Registration
+// Configured for PostgreSQL (or SQLite locally)
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Registration {
+  id               Int      @id @default(autoincrement())
+  registrationCode String   @unique @map("registration_code")
+  fullName         String   @map("full_name")
+  mobileNumber     String   @map("mobile_number")
+  universityEmail  String   @unique @map("university_email")
+  personalEmail    String   @map("personal_email")
+  academicLevel    String   @map("academic_level")
+  studentId        String?  @map("student_id")
+  status           String   @default("new") // new, reviewed, approved, rejected
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  @@map("registrations")
+}
+
+model Setting {
+  id                 Int     @id @default(1)
+  isRegistrationOpen Boolean @default(true) @map("is_registration_open")
+  academicLevel      String  @default("قۆناغی سێیەم") @map("academic_level")
+  registrationTitle  String  @default("خۆتۆمارکردنی قوتابیان بۆ سمستەری سێیەم") @map("registration_title")
+  instructionText    String  @default("تکایە زانیارییەکان بە وردی و دروستی پڕبکەرەوە، پاشان فۆرمەکە بنێرە.") @map("instruction_text")
+
+  @@map("settings")
+}
+
+model Admin {
+  id           Int      @id @default(autoincrement())
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  @@map("admins")
+}

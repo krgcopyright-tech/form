@@ -1,0 +1,25 @@
+@import "tailwindcss";
+
+@font-face {
+  font-family: 'Rabar';
+  src: url('/rabar.ttf') format('truetype');
+  font-weight: normal;
+  font-style: normal;
+  font-display: swap;
+}
+
+@layer base {
+  * {
+    font-family: 'Rabar', 'Noto Sans Arabic', system-ui, -apple-system, sans-serif;
+  }
+  body {
+    font-family: 'Rabar', 'Noto Sans Arabic', system-ui, -apple-system, sans-serif;
+  }
+}
+
+@media print {
+  body {
+    background-color: #ffffff !important;
+    color: #000000 !important;
+  }
+}

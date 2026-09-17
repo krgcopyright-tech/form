@@ -1,0 +1,6 @@
+{
+  "name": "EPU MIS Student Registration",
+  "description": "سیستەمی خۆتۆمارکردنی ئۆنلاینی قوتابیان بۆ بەشی سیستمی زانیاری کارگێڕی لە پەیمانگەی تەکنیکی کارگێڕی هەولێر - زانکۆی پۆلیتەکنیکی هەولێر",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
