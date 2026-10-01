@@ -6,15 +6,30 @@ import bcrypt from 'bcryptjs';
 import * as XLSX from 'xlsx';
 import { createServer as createViteServer } from 'vite';
 import {
-  db,
   initDatabase,
+  getSettings,
+  updateSettings,
+  findAdminByEmail,
+  findAdminById,
+  updateAdminPassword,
+  createSession,
+  getSession,
+  deleteSession,
+  findRegistrationByUniversityEmail,
+  findDuplicateEmailExcept,
   generateRegistrationCode,
+  createRegistration,
+  getRegistrationById,
+  updateRegistration,
+  updateRegistrationStatus,
+  getRegistrations,
+  getAllRegistrationsForExport,
   type RegistrationRecord,
   type AppSettings,
 } from './server/db.ts';
 
 // Initialize the database tables and seed
-initDatabase();
+initDatabase().catch((err) => console.warn('Database initialization note:', err));
 
 const app = express();
 const PORT = 3000;
@@ -52,7 +67,7 @@ function resetFailedLogin(ip: string) {
 }
 
 // Authentication middleware
-function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction) {
+async function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction) {
   const authHeader = req.headers.authorization;
   let token = req.cookies?.admin_token;
   if (!token && authHeader && authHeader.startsWith('Bearer ')) {
@@ -68,16 +83,13 @@ function requireAdmin(req: express.Request, res: express.Response, next: express
   }
 
   try {
-    const session = db
-      .prepare('SELECT * FROM sessions WHERE token = ? AND expires_at > ?')
-      .get(token, Date.now()) as { token: string; admin_id: number; expires_at: number } | undefined;
-
+    const session = await getSession(token);
     if (!session) {
       res.status(401).json({ error: 'تکایە سەرەتا بچۆ ژوورەوە.' });
       return;
     }
 
-    const admin = db.prepare('SELECT id, email FROM admins WHERE id = ?').get(session.admin_id) as { id: number; email: string } | undefined;
+    const admin = await findAdminById(session.admin_id);
     if (!admin) {
       res.status(401).json({ error: 'بەکارهێنەر نەدۆزرایەوە.' });
       return;
@@ -96,9 +108,9 @@ function requireAdmin(req: express.Request, res: express.Response, next: express
 // ==========================================
 
 // Get current public settings
-app.get('/api/settings', (req, res) => {
+app.get('/api/settings', async (req, res) => {
   try {
-    const settings = db.prepare('SELECT * FROM settings WHERE id = 1').get() as unknown as AppSettings;
+    const settings = await getSettings();
     res.json({
       isRegistrationOpen: Boolean(settings.is_registration_open),
       academicLevel: settings.academic_level,
@@ -112,16 +124,23 @@ app.get('/api/settings', (req, res) => {
 });
 
 // Student registration submission
-app.post('/api/register', (req, res) => {
+app.post('/api/register', async (req, res) => {
   try {
     // 1. Check if registration is open
-    const settings = db.prepare('SELECT is_registration_open FROM settings WHERE id = 1').get() as { is_registration_open: number };
+    const settings = await getSettings();
     if (!settings || settings.is_registration_open !== 1) {
       res.status(403).json({ error: 'تۆمارکردن بۆ ئێستا داخراوە.' });
       return;
     }
 
-    let { full_name, mobile_number, university_email, university_email_note, personal_email, personal_email_note, academic_level, student_id } = req.body;
+    let full_name = req.body.full_name || req.body.fullName || '';
+    let mobile_number = req.body.mobile_number || req.body.mobileNumber || '';
+    let university_email = req.body.university_email || req.body.universityEmail || '';
+    let university_email_note = req.body.university_email_note || req.body.universityEmailNote || null;
+    let personal_email = req.body.personal_email || req.body.personalEmail || '';
+    let personal_email_note = req.body.personal_email_note || req.body.personalEmailNote || null;
+    let academic_level = req.body.academic_level || req.body.academicLevel || 'قۆناغی سێیەم';
+    let student_id = req.body.student_id || req.body.studentId || null;
 
     // Sanitize and trim
     full_name = typeof full_name === 'string' ? full_name.trim() : '';
@@ -139,7 +158,7 @@ app.post('/api/register', (req, res) => {
       return;
     }
 
-    // Iraqi mobile regex: accepts 07XXXXXXXXX (11 digits), or +9647XXXXXXXXX
+    // Mobile validation: accepts 07XXXXXXXXX (11 digits), or +9647XXXXXXXXX
     const cleanedMobile = mobile_number.replace(/[\s\-\(\)]/g, '');
     const mobileRegex = /^(07[3-9]\d{8}|07\d{9}|\+?9647\d{9})$/;
     if (!mobileRegex.test(cleanedMobile)) {
@@ -164,38 +183,27 @@ app.post('/api/register', (req, res) => {
     }
 
     // 3. Duplicate check on university email
-    const existing = db
-      .prepare('SELECT id FROM registrations WHERE LOWER(university_email) = LOWER(?)')
-      .get(university_email);
-
+    const existing = await findRegistrationByUniversityEmail(university_email);
     if (existing) {
       res.status(409).json({ error: 'ئەم ئیمەیڵە پێشتر تۆمار کراوە.', field: 'university_email' });
       return;
     }
 
     // 4. Generate unique reference code
-    const registrationCode = generateRegistrationCode();
+    const registrationCode = await generateRegistrationCode();
 
     // 5. Insert record
-    const insertStmt = db.prepare(`
-      INSERT INTO registrations (
-        registration_code, full_name, mobile_number, university_email, university_email_note, personal_email, personal_email_note, academic_level, student_id, status, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', datetime('now', 'localtime'))
-    `);
-
-    const result = insertStmt.run(
-      registrationCode,
+    const newRecord = await createRegistration({
+      registration_code: registrationCode,
       full_name,
-      cleanedMobile,
+      mobile_number: cleanedMobile,
       university_email,
-      university_email_note || null,
+      university_email_note,
       personal_email,
-      personal_email_note || null,
+      personal_email_note,
       academic_level,
-      student_id || null
-    );
-
-    const newRecord = db.prepare('SELECT * FROM registrations WHERE id = ?').get(result.lastInsertRowid) as unknown as RegistrationRecord;
+      student_id,
+    });
 
     res.status(201).json({
       success: true,
@@ -213,7 +221,7 @@ app.post('/api/register', (req, res) => {
 // ADMIN AUTHENTICATION
 // ==========================================
 
-app.post('/api/admin/login', (req, res) => {
+app.post('/api/admin/login', async (req, res) => {
   const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
   if (!checkRateLimit(clientIp)) {
     res.status(429).json({ error: 'هەوڵی زۆر دراوە. تکایە دوای ١٥ خولەک هەوڵبدەرەوە.' });
@@ -227,7 +235,7 @@ app.post('/api/admin/login', (req, res) => {
   }
 
   try {
-    const admin = db.prepare('SELECT * FROM admins WHERE LOWER(email) = LOWER(?)').get(email.trim()) as { id: number; email: string; password_hash: string } | undefined;
+    const admin = await findAdminByEmail(email.trim());
 
     if (!admin || !bcrypt.compareSync(password, admin.password_hash)) {
       recordFailedLogin(clientIp);
@@ -241,7 +249,7 @@ app.post('/api/admin/login', (req, res) => {
     const token = crypto.randomBytes(32).toString('hex');
     const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000;
 
-    db.prepare('INSERT INTO sessions (token, admin_id, expires_at) VALUES (?, ?, ?)').run(token, admin.id, expiresAt);
+    await createSession(token, admin.id, expiresAt);
 
     // Set cookie (support both modern browsers and iframe embedding)
     res.cookie('admin_token', token, {
@@ -262,11 +270,11 @@ app.post('/api/admin/login', (req, res) => {
   }
 });
 
-app.post('/api/admin/logout', requireAdmin, (req, res) => {
+app.post('/api/admin/logout', requireAdmin, async (req, res) => {
   try {
     const token = req.cookies?.admin_token || (req.headers.authorization?.startsWith('Bearer ') && req.headers.authorization.substring(7));
     if (token) {
-      db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+      await deleteSession(token);
     }
     res.clearCookie('admin_token');
     res.json({ success: true, message: 'بە سەرکەوتوویی دەرچوویت.' });
@@ -281,7 +289,7 @@ app.get('/api/admin/me', requireAdmin, (req, res) => {
 });
 
 // Change admin password
-app.post('/api/admin/change-password', requireAdmin, (req, res) => {
+app.post('/api/admin/change-password', requireAdmin, async (req, res) => {
   const { currentPassword, newPassword } = req.body;
   const admin = (req as any).admin;
 
@@ -291,14 +299,14 @@ app.post('/api/admin/change-password', requireAdmin, (req, res) => {
   }
 
   try {
-    const row = db.prepare('SELECT password_hash FROM admins WHERE id = ?').get(admin.id) as { password_hash: string };
-    if (!bcrypt.compareSync(currentPassword, row.password_hash)) {
+    const freshAdmin = await findAdminById(admin.id);
+    if (!freshAdmin || !bcrypt.compareSync(currentPassword, freshAdmin.password_hash)) {
       res.status(400).json({ error: 'وشەی نهێنی ئێستا هەڵەیە.' });
       return;
     }
 
     const newHash = bcrypt.hashSync(newPassword, 10);
-    db.prepare('UPDATE admins SET password_hash = ? WHERE id = ?').run(newHash, admin.id);
+    await updateAdminPassword(admin.id, newHash);
     res.json({ success: true, message: 'وشەی نهێنی بە سەرکەوتوویی گۆڕدرا.' });
   } catch (err) {
     res.status(500).json({ error: 'هەڵە لە نوێکردنەوەی وشەی نهێنی.' });
@@ -309,83 +317,26 @@ app.post('/api/admin/change-password', requireAdmin, (req, res) => {
 // ADMIN DASHBOARD & REGISTRATION MANAGEMENT
 // ==========================================
 
-// Helper to build filter queries
-function buildFilterQuery(queryParams: any) {
-  const { search, status, academic_level } = queryParams;
-  let whereClauses: string[] = ['1=1'];
-  let params: any[] = [];
-
-  if (status && status !== 'all') {
-    whereClauses.push('status = ?');
-    params.push(status);
-  }
-
-  if (academic_level && academic_level !== 'all') {
-    whereClauses.push('academic_level = ?');
-    params.push(academic_level);
-  }
-
-  if (search && search.trim()) {
-    const q = `%${search.trim()}%`;
-    whereClauses.push(`(
-      full_name LIKE ? OR 
-      university_email LIKE ? OR 
-      university_email_note LIKE ? OR 
-      personal_email LIKE ? OR 
-      personal_email_note LIKE ? OR 
-      mobile_number LIKE ? OR 
-      registration_code LIKE ? OR 
-      student_id LIKE ?
-    )`);
-    params.push(q, q, q, q, q, q, q, q);
-  }
-
-  return { where: whereClauses.join(' AND '), params };
-}
-
 // Get paginated registrations + summary counts
-app.get('/api/admin/registrations', requireAdmin, (req, res) => {
+app.get('/api/admin/registrations', requireAdmin, async (req, res) => {
   try {
-    const page = Math.max(1, parseInt(req.query.page as string) || 1);
-    const limit = Math.min(100, Math.max(10, parseInt(req.query.limit as string) || 25));
-    const offset = (page - 1) * limit;
+    const page = parseInt(req.query.page as string) || 1;
+    const limit = parseInt(req.query.limit as string) || 25;
     const sort = (req.query.sort as string) || 'newest';
+    const search = (req.query.search as string) || '';
+    const status = (req.query.status as string) || '';
+    const academic_level = (req.query.academic_level as string) || '';
 
-    const { where, params } = buildFilterQuery(req.query);
-
-    let orderBy = 'created_at DESC';
-    if (sort === 'oldest') {
-      orderBy = 'created_at ASC';
-    } else if (sort === 'name') {
-      orderBy = 'full_name ASC';
-    }
-
-    // Count filtered records
-    const countSql = `SELECT COUNT(*) as total FROM registrations WHERE ${where}`;
-    const countRes = db.prepare(countSql).get(...params) as { total: number };
-    const total = countRes.total;
-
-    // Fetch records
-    const listSql = `SELECT * FROM registrations WHERE ${where} ORDER BY ${orderBy} LIMIT ? OFFSET ?`;
-    const records = db.prepare(listSql).all(...params, limit, offset) as unknown as RegistrationRecord[];
-
-    // Calculate overall stats
-    const stats = {
-      total: (db.prepare('SELECT COUNT(*) as c FROM registrations').get() as any).c,
-      new: (db.prepare("SELECT COUNT(*) as c FROM registrations WHERE status = 'new'").get() as any).c,
-      reviewed: (db.prepare("SELECT COUNT(*) as c FROM registrations WHERE status = 'reviewed'").get() as any).c,
-      approved: (db.prepare("SELECT COUNT(*) as c FROM registrations WHERE status = 'approved'").get() as any).c,
-      rejected: (db.prepare("SELECT COUNT(*) as c FROM registrations WHERE status = 'rejected'").get() as any).c,
-    };
-
-    res.json({
-      records,
-      total,
+    const result = await getRegistrations({
       page,
       limit,
-      totalPages: Math.ceil(total / limit) || 1,
-      stats,
+      sort,
+      search,
+      status,
+      academic_level,
     });
+
+    res.json(result);
   } catch (err) {
     console.error('Error fetching registrations:', err);
     res.status(500).json({ error: 'هەڵە لە هێنانی تۆمارەکان.' });
@@ -393,10 +344,10 @@ app.get('/api/admin/registrations', requireAdmin, (req, res) => {
 });
 
 // View single registration
-app.get('/api/admin/registrations/:id', requireAdmin, (req, res) => {
+app.get('/api/admin/registrations/:id', requireAdmin, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
-    const record = db.prepare('SELECT * FROM registrations WHERE id = ?').get(id) as unknown as RegistrationRecord | undefined;
+    const record = await getRegistrationById(id);
     if (!record) {
       res.status(404).json({ error: 'تۆمارەکە نەدۆزرایەوە.' });
       return;
@@ -408,12 +359,12 @@ app.get('/api/admin/registrations/:id', requireAdmin, (req, res) => {
 });
 
 // Update registration details
-app.put('/api/admin/registrations/:id', requireAdmin, (req, res) => {
+app.put('/api/admin/registrations/:id', requireAdmin, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
     let { full_name, mobile_number, university_email, university_email_note, personal_email, personal_email_note, academic_level, student_id, status } = req.body;
 
-    const existing = db.prepare('SELECT * FROM registrations WHERE id = ?').get(id) as unknown as RegistrationRecord | undefined;
+    const existing = await getRegistrationById(id);
     if (!existing) {
       res.status(404).json({ error: 'تۆمارەکە نەدۆزرایەوە.' });
       return;
@@ -430,30 +381,24 @@ app.put('/api/admin/registrations/:id', requireAdmin, (req, res) => {
     status = ['new', 'reviewed', 'approved', 'rejected'].includes(status) ? status : existing.status;
 
     // Check duplicate email with another record
-    const emailConflict = db
-      .prepare('SELECT id FROM registrations WHERE LOWER(university_email) = LOWER(?) AND id != ?')
-      .get(university_email, id);
-
+    const emailConflict = await findDuplicateEmailExcept(university_email, id);
     if (emailConflict) {
       res.status(409).json({ error: 'ئەم ئیمەیڵە بۆ قوتابییەکی تر تۆمارکراوە.' });
       return;
     }
 
-    db.prepare(`
-      UPDATE registrations SET
-        full_name = ?,
-        mobile_number = ?,
-        university_email = ?,
-        university_email_note = ?,
-        personal_email = ?,
-        personal_email_note = ?,
-        academic_level = ?,
-        student_id = ?,
-        status = ?
-      WHERE id = ?
-    `).run(full_name, mobile_number, university_email, university_email_note, personal_email, personal_email_note, academic_level, student_id, status, id);
+    const updated = await updateRegistration(id, {
+      full_name,
+      mobile_number,
+      university_email,
+      university_email_note,
+      personal_email,
+      personal_email_note,
+      academic_level,
+      student_id,
+      status,
+    });
 
-    const updated = db.prepare('SELECT * FROM registrations WHERE id = ?').get(id);
     res.json({ success: true, message: 'تۆمارەکە بە سەرکەوتوویی نوێکرایەوە.', record: updated });
   } catch (err) {
     console.error('Error updating registration:', err);
@@ -462,7 +407,7 @@ app.put('/api/admin/registrations/:id', requireAdmin, (req, res) => {
 });
 
 // Fast update status only
-app.patch('/api/admin/registrations/:id/status', requireAdmin, (req, res) => {
+app.patch('/api/admin/registrations/:id/status', requireAdmin, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
     const { status } = req.body;
@@ -472,7 +417,7 @@ app.patch('/api/admin/registrations/:id/status', requireAdmin, (req, res) => {
       return;
     }
 
-    db.prepare('UPDATE registrations SET status = ? WHERE id = ?').run(status, id);
+    await updateRegistrationStatus(id, status);
     res.json({ success: true, status });
   } catch (err) {
     res.status(500).json({ error: 'هەڵە لە گۆڕینی بار.' });
@@ -480,23 +425,16 @@ app.patch('/api/admin/registrations/:id/status', requireAdmin, (req, res) => {
 });
 
 // Update system settings (Open/Close, Active level, Title, Instructions)
-app.put('/api/admin/settings', requireAdmin, (req, res) => {
+app.put('/api/admin/settings', requireAdmin, async (req, res) => {
   try {
     const { isRegistrationOpen, academicLevel, registrationTitle, instructionText } = req.body;
 
-    db.prepare(`
-      UPDATE settings SET
-        is_registration_open = ?,
-        academic_level = ?,
-        registration_title = ?,
-        instruction_text = ?
-      WHERE id = 1
-    `).run(
-      isRegistrationOpen ? 1 : 0,
-      academicLevel || 'قۆناغی سێیەم',
-      registrationTitle || 'خۆتۆمارکردنی قوتابیان بۆ سمستەری سێیەم',
-      instructionText || 'تکایە زانیارییەکان بە وردی و دروستی پڕبکەرەوە، پاشان فۆرمەکە بنێرە.'
-    );
+    await updateSettings({
+      is_registration_open: isRegistrationOpen ? 1 : 0,
+      academic_level: academicLevel || 'قۆناغی سێیەم',
+      registration_title: registrationTitle || 'خۆتۆمارکردنی قوتابیان بۆ سمستەری سێیەم',
+      instruction_text: instructionText || 'تکایە زانیارییەکان بە وردی و دروستی پڕبکەرەوە، پاشان فۆرمەکە بنێرە.',
+    });
 
     res.json({ success: true, message: 'ڕێکخستنەکان بە سەرکەوتوویی پاشەکەوتکران.' });
   } catch (err) {
@@ -522,15 +460,14 @@ function getKurdishStatus(status: string): string {
 }
 
 // Export to Excel (.xlsx) preserving Kurdish Sorani characters
-app.get('/api/admin/export/excel', requireAdmin, (req, res) => {
+app.get('/api/admin/export/excel', requireAdmin, async (req, res) => {
   try {
-    const { where, params } = buildFilterQuery(req.query);
-    const sort = (req.query.sort as string) || 'newest';
-    let orderBy = 'created_at DESC';
-    if (sort === 'oldest') orderBy = 'created_at ASC';
-    else if (sort === 'name') orderBy = 'full_name ASC';
-
-    const records = db.prepare(`SELECT * FROM registrations WHERE ${where} ORDER BY ${orderBy}`).all(...params) as unknown as RegistrationRecord[];
+    const records = await getAllRegistrationsForExport({
+      search: req.query.search as string,
+      status: req.query.status as string,
+      academic_level: req.query.academic_level as string,
+      sort: (req.query.sort as string) || 'newest',
+    });
 
     const excelData = records.map((r, index) => ({
       'زنجیرە': index + 1,
@@ -548,7 +485,6 @@ app.get('/api/admin/export/excel', requireAdmin, (req, res) => {
     }));
 
     const worksheet = XLSX.utils.json_to_sheet(excelData);
-    // RTL sheet view setting
     if (!worksheet['!views']) {
       worksheet['!views'] = [{ rightToLeft: true }];
     }
@@ -567,15 +503,14 @@ app.get('/api/admin/export/excel', requireAdmin, (req, res) => {
 });
 
 // Export to CSV with UTF-8 BOM so Excel opens Kurdish characters correctly
-app.get('/api/admin/export/csv', requireAdmin, (req, res) => {
+app.get('/api/admin/export/csv', requireAdmin, async (req, res) => {
   try {
-    const { where, params } = buildFilterQuery(req.query);
-    const sort = (req.query.sort as string) || 'newest';
-    let orderBy = 'created_at DESC';
-    if (sort === 'oldest') orderBy = 'created_at ASC';
-    else if (sort === 'name') orderBy = 'full_name ASC';
-
-    const records = db.prepare(`SELECT * FROM registrations WHERE ${where} ORDER BY ${orderBy}`).all(...params) as unknown as RegistrationRecord[];
+    const records = await getAllRegistrationsForExport({
+      search: req.query.search as string,
+      status: req.query.status as string,
+      academic_level: req.query.academic_level as string,
+      sort: (req.query.sort as string) || 'newest',
+    });
 
     const headers = ['زنجیرە', 'کۆدی تۆمارکردن', 'ناوی سیانی', 'ژمارەی مۆبایل', 'ئیمەیلی زانکۆ', 'تێبینیی ئیمەیلی زانکۆ', 'ئیمەیلی تایبەتی', 'تێبینیی ئیمەیلی تایبەتی', 'قۆناغ', 'ژمارەی قوتابی', 'بار', 'بەروار'];
     const rows = records.map((r, i) => [
@@ -628,4 +563,9 @@ async function start() {
   });
 }
 
-start();
+// Only listen directly if not running in a serverless environment like Vercel
+if (!process.env.VERCEL) {
+  start();
+}
+
+export default app;

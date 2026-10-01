@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { ShieldCheck, Mail, Lock, LogIn, AlertCircle, Info } from 'lucide-react';
+import { getLocalSettings } from '../services/storageService';
 
 interface AdminLoginProps {
   onLoginSuccess: (email: string, token: string) => void;
@@ -15,7 +16,8 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
     e.preventDefault();
     setError(null);
 
-    if (!email.trim() || !password) {
+    const cleanEmail = email.trim().toLowerCase();
+    if (!cleanEmail || !password) {
       setError('تکایە ئیمەیل و وشەی نهێنی بنووسە.');
       return;
     }
@@ -29,23 +31,32 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess }) => {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          email: email.trim(),
+          email: cleanEmail,
           password,
         }),
       });
 
-      const data = await response.json();
-
-      if (!response.ok) {
-        setError(data.error || 'چوونەژوورەوە سەرکەوتوو نەبوو.');
-        setLoading(false);
+      if (response.ok) {
+        const data = await response.json();
+        onLoginSuccess(data.email, data.token);
         return;
       }
-
-      onLoginSuccess(data.email, data.token);
     } catch (err) {
-      console.error('Login error:', err);
-      setError('پەیوەندی لەگەڵ سێرڤەر سەرکەوتوو نەبوو.');
+      // In static / GitHub Pages mode, network request fails or returns 404
+      console.log('Server not reachable, falling back to local admin check.');
+    }
+
+    // Client-side fallback check (for GitHub Pages / static mode)
+    const settings = getLocalSettings();
+    const validPassword = settings.adminPassword || 'admin123456';
+    
+    if (cleanEmail === 'admin@epu.edu.iq' && password === validPassword) {
+      const clientToken = 'epu_admin_static_' + Date.now();
+      localStorage.setItem('epu_admin_token', clientToken);
+      localStorage.setItem('epu_admin_email', cleanEmail);
+      onLoginSuccess(cleanEmail, clientToken);
+    } else {
+      setError('ئیمەیل یان وشەی نهێنی هەڵەیە.');
       setLoading(false);
     }
   };

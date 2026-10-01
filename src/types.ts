@@ -13,6 +13,7 @@ export interface Registration {
   student_id: string | null;
   status: RegistrationStatus;
   created_at: string;
+  synced_to_sheet?: boolean;
 }
 
 export interface AppSettings {
@@ -20,6 +21,9 @@ export interface AppSettings {
   academicLevel: string;
   registrationTitle: string;
   instructionText: string;
+  googleSheetScriptUrl?: string;
+  googleSheetViewUrl?: string;
+  adminPassword?: string;
 }
 
 export interface DashboardStats {

@@ -15,15 +15,27 @@ import {
   RefreshCw,
   ChevronRight,
   ChevronLeft,
-  ChevronDown,
   ShieldCheck,
   Calendar,
   KeyRound,
   Clock,
+  FileSpreadsheet,
+  ExternalLink,
+  UploadCloud,
+  Check,
+  AlertCircle,
 } from 'lucide-react';
 import type { Registration, RegistrationStatus, DashboardStats, AppSettings } from '../types';
 import { ViewRecordModal, EditRecordModal } from './RecordModals';
 import { AdminSettingsModal } from './AdminSettings';
+import {
+  getLocalRegistrations,
+  saveLocalRegistrations,
+  calculateStats,
+  exportRegistrationsToExcel,
+  exportRegistrationsToCsv,
+} from '../services/storageService';
+import { sendRegistrationToGoogleSheets } from '../services/googleSheetsService';
 
 interface AdminDashboardProps {
   adminEmail: string;
@@ -64,20 +76,24 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [viewingRecord, setViewingRecord] = useState<Registration | null>(null);
   const [editingRecord, setEditingRecord] = useState<Registration | null>(null);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
-  const [showPasswordModal, setShowPasswordModal] = useState(false);
+
+  // Google Sheets sync state
+  const [syncingSheets, setSyncingSheets] = useState(false);
+  const [syncFeedback, setSyncFeedback] = useState<{ success: boolean; message: string } | null>(null);
 
   // Debounce search input
   useEffect(() => {
     const timer = setTimeout(() => {
       setDebouncedSearch(search);
-      setPage(1); // Reset to first page on new search
+      setPage(1);
     }, 300);
     return () => clearTimeout(timer);
   }, [search]);
 
-  // Fetch registrations
+  // Fetch registrations (hybrid: server first, fallback to local storage)
   const fetchRegistrations = useCallback(async () => {
     setLoading(true);
+
     try {
       const params = new URLSearchParams({
         page: page.toString(),
@@ -95,26 +111,65 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         },
         credentials: 'include',
       });
+
       if (response.status === 401) {
         onLogout();
         return;
       }
 
-      const data = await response.json();
       if (response.ok) {
+        const data = await response.json();
         setRecords(data.records || []);
         setTotalPages(data.totalPages || 1);
         setTotalCount(data.total || 0);
         if (data.stats) {
           setStats(data.stats);
         }
+        setLoading(false);
+        return;
       }
     } catch (err) {
-      console.error('Failed to fetch registrations:', err);
-    } finally {
-      setLoading(false);
+      // In static / GitHub Pages mode, network request fails or returns 404
     }
-  }, [page, limit, sortOrder, debouncedSearch, statusFilter, levelFilter, onLogout]);
+
+    // Local Storage Fallback (for static / GitHub Pages)
+    let all = getLocalRegistrations();
+
+    if (debouncedSearch.trim()) {
+      const q = debouncedSearch.trim().toLowerCase();
+      all = all.filter(
+        (r) =>
+          r.full_name.toLowerCase().includes(q) ||
+          r.registration_code.toLowerCase().includes(q) ||
+          r.university_email.toLowerCase().includes(q) ||
+          r.personal_email.toLowerCase().includes(q) ||
+          r.mobile_number.includes(q)
+      );
+    }
+
+    if (statusFilter !== 'all') {
+      all = all.filter((r) => r.status === statusFilter);
+    }
+
+    if (levelFilter !== 'all') {
+      all = all.filter((r) => r.academic_level === levelFilter);
+    }
+
+    if (sortOrder === 'name') {
+      all.sort((a, b) => a.full_name.localeCompare(b.full_name, 'ckb'));
+    } else if (sortOrder === 'oldest') {
+      all.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+    } else {
+      all.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+    }
+
+    setStats(calculateStats(getLocalRegistrations()));
+    setTotalCount(all.length);
+    setTotalPages(Math.max(1, Math.ceil(all.length / limit)));
+    const startIndex = (page - 1) * limit;
+    setRecords(all.slice(startIndex, startIndex + limit));
+    setLoading(false);
+  }, [page, limit, sortOrder, debouncedSearch, statusFilter, levelFilter, adminToken, onLogout]);
 
   useEffect(() => {
     fetchRegistrations();
@@ -122,8 +177,19 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
   // Quick Status change
   const handleQuickStatusChange = async (id: number, newStatus: RegistrationStatus) => {
+    // 1. Update in local storage
+    const currentLocal = getLocalRegistrations();
+    const updated = currentLocal.map((r) => (r.id === id ? { ...r, status: newStatus } : r));
+    saveLocalRegistrations(updated);
+
+    setRecords((prev) =>
+      prev.map((r) => (r.id === id ? { ...r, status: newStatus } : r))
+    );
+    setStats(calculateStats(updated));
+
+    // 2. Try server update
     try {
-      const response = await fetch(`/api/admin/registrations/${id}/status`, {
+      await fetch(`/api/admin/registrations/${id}/status`, {
         method: 'PATCH',
         headers: {
           'Content-Type': 'application/json',
@@ -132,31 +198,65 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         credentials: 'include',
         body: JSON.stringify({ status: newStatus }),
       });
-
-      if (response.ok) {
-        setRecords((prev) =>
-          prev.map((r) => (r.id === id ? { ...r, status: newStatus } : r))
-        );
-        fetchRegistrations(); // Refresh stats
-      }
     } catch (err) {
-      console.error('Status update failed:', err);
+      // Graceful offline fallback
     }
   };
 
-  // Export files respecting active filters
-  const getExportUrl = (type: 'excel' | 'csv') => {
-    const params = new URLSearchParams({
-      sort: sortOrder,
-    });
-    if (adminToken) params.append('token', adminToken);
-    if (debouncedSearch.trim()) params.append('search', debouncedSearch.trim());
-    if (statusFilter !== 'all') params.append('status', statusFilter);
-    if (levelFilter !== 'all') params.append('academic_level', levelFilter);
-    return `/api/admin/export/${type}?${params.toString()}`;
+  // Direct Excel download
+  const handleExportExcel = () => {
+    const all = getLocalRegistrations();
+    exportRegistrationsToExcel(all.length > 0 ? all : records);
   };
 
-  // Status badges & text
+  // Direct CSV download
+  const handleExportCsv = () => {
+    const all = getLocalRegistrations();
+    exportRegistrationsToCsv(all.length > 0 ? all : records);
+  };
+
+  // Sync all records to Google Sheets
+  const handleSyncToSheets = async () => {
+    if (!appSettings.googleSheetScriptUrl) {
+      setShowSettingsModal(true);
+      return;
+    }
+
+    setSyncingSheets(true);
+    setSyncFeedback(null);
+
+    const all = getLocalRegistrations();
+    let sentCount = 0;
+
+    for (const item of all) {
+      if (!item.synced_to_sheet) {
+        const res = await sendRegistrationToGoogleSheets(item, appSettings.googleSheetScriptUrl);
+        if (res.success) {
+          item.synced_to_sheet = true;
+          sentCount++;
+        }
+      }
+    }
+
+    saveLocalRegistrations(all);
+    fetchRegistrations();
+    setSyncingSheets(false);
+
+    if (sentCount > 0) {
+      setSyncFeedback({
+        success: true,
+        message: `${sentCount} تۆمار بە سەرکەوتوویی ڕەوانەی Google Sheets کران.`,
+      });
+    } else {
+      setSyncFeedback({
+        success: true,
+        message: 'هەموو تۆمارەکان لە ئێستادا هاوکاتن لەگەڵ Google Sheets.',
+      });
+    }
+
+    setTimeout(() => setSyncFeedback(null), 5000);
+  };
+
   const renderStatusBadge = (status: RegistrationStatus) => {
     switch (status) {
       case 'new':
@@ -202,6 +302,42 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          
+          {/* Google Sheets button */}
+          {appSettings.googleSheetViewUrl ? (
+            <a
+              href={appSettings.googleSheetViewUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="px-3 py-2 rounded-xl text-xs font-bold bg-emerald-50 text-emerald-800 border border-emerald-200 hover:bg-emerald-100 transition flex items-center gap-1.5 shadow-xs"
+            >
+              <FileSpreadsheet className="w-4 h-4 text-emerald-600" />
+              <span>کردنەوەی Google Sheet</span>
+              <ExternalLink className="w-3.5 h-3.5 text-emerald-600" />
+            </a>
+          ) : (
+            <button
+              onClick={() => setShowSettingsModal(true)}
+              className="px-3 py-2 rounded-xl text-xs font-bold bg-emerald-50 text-emerald-800 border border-emerald-200 hover:bg-emerald-100 transition flex items-center gap-1.5 shadow-xs"
+            >
+              <FileSpreadsheet className="w-4 h-4 text-emerald-600" />
+              <span>بەستنەوە بە Google Sheets</span>
+            </button>
+          )}
+
+          {/* Sync to Sheet button */}
+          {appSettings.googleSheetScriptUrl && (
+            <button
+              onClick={handleSyncToSheets}
+              disabled={syncingSheets}
+              className="px-3 py-2 rounded-xl text-xs font-bold bg-white border border-emerald-300 text-emerald-700 hover:bg-emerald-50 transition flex items-center gap-1.5 shadow-xs"
+              title="هاوکاتکردنی هەر تۆمارێک کە لە Google Sheets دا نەبووە"
+            >
+              <UploadCloud className={`w-4 h-4 ${syncingSheets ? 'animate-bounce' : ''}`} />
+              <span>{syncingSheets ? 'ناردن...' : 'هاوکاتکردن لەگەڵ Sheet'}</span>
+            </button>
+          )}
+
           {/* Settings button */}
           <button
             onClick={() => setShowSettingsModal(true)}
@@ -211,13 +347,24 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             <span>ڕێکخستنەکان</span>
           </button>
 
-          {/* Change password button */}
+          {/* Excel Export */}
           <button
-            onClick={() => setShowPasswordModal(true)}
-            className="px-3 py-2 rounded-xl text-xs font-bold bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 transition flex items-center gap-1.5 shadow-xs"
+            type="button"
+            onClick={handleExportExcel}
+            className="px-3 py-2 rounded-xl text-xs font-bold bg-emerald-700 hover:bg-emerald-800 text-white transition flex items-center gap-1.5 shadow-xs cursor-pointer"
           >
-            <KeyRound className="w-4 h-4 text-slate-500" />
-            <span>گۆڕینی وشەی نهێنی</span>
+            <Download className="w-4 h-4" />
+            <span>داگرتنی Excel (.xlsx)</span>
+          </button>
+
+          {/* CSV Export */}
+          <button
+            type="button"
+            onClick={handleExportCsv}
+            className="px-3 py-2 rounded-xl text-xs font-bold bg-slate-800 hover:bg-slate-900 text-white transition flex items-center gap-1.5 shadow-xs cursor-pointer"
+          >
+            <Download className="w-4 h-4" />
+            <span>داگرتنی CSV</span>
           </button>
 
           {/* Print button */}
@@ -228,26 +375,6 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             <Printer className="w-4 h-4 text-slate-500" />
             <span>چاپکردن</span>
           </button>
-
-          {/* Excel Export */}
-          <a
-            href={getExportUrl('excel')}
-            download
-            className="px-3 py-2 rounded-xl text-xs font-bold bg-emerald-700 hover:bg-emerald-800 text-white transition flex items-center gap-1.5 shadow-xs"
-          >
-            <Download className="w-4 h-4" />
-            <span>داگرتنی Excel</span>
-          </a>
-
-          {/* CSV Export */}
-          <a
-            href={getExportUrl('csv')}
-            download
-            className="px-3 py-2 rounded-xl text-xs font-bold bg-slate-800 hover:bg-slate-900 text-white transition flex items-center gap-1.5 shadow-xs"
-          >
-            <Download className="w-4 h-4" />
-            <span>داگرتنی CSV</span>
-          </a>
 
           {/* Refresh button */}
           <button
@@ -260,10 +387,51 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         </div>
       </div>
 
+      {/* Sync feedback notification */}
+      {syncFeedback && (
+        <div
+          className={`my-4 p-3 rounded-xl text-xs font-semibold flex items-center gap-2 ${
+            syncFeedback.success
+              ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+              : 'bg-red-50 text-red-800 border border-red-200'
+          }`}
+        >
+          {syncFeedback.success ? (
+            <CheckCircle className="w-4 h-4 text-emerald-600" />
+          ) : (
+            <AlertCircle className="w-4 h-4 text-red-600" />
+          )}
+          <span>{syncFeedback.message}</span>
+        </div>
+      )}
+
+      {/* Google Sheets Status Banner */}
+      {!appSettings.googleSheetScriptUrl && (
+        <div className="my-4 p-4 rounded-2xl bg-gradient-to-r from-emerald-50 to-teal-50 border border-emerald-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 print:hidden">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl bg-emerald-600 text-white flex items-center justify-center shrink-0">
+              <FileSpreadsheet className="w-5 h-5" />
+            </div>
+            <div>
+              <div className="font-bold text-sm text-emerald-950">
+                سیستەمی Google Sheets ئامادەیە بۆ بەستنەوە!
+              </div>
+              <div className="text-xs text-emerald-800 mt-0.5">
+                تەنها لینکی Web App لە ڕێکخستنەکان دابنێ بۆ ئەوەی هەر قوتابییەک خۆی تۆمارکرد ڕاستەوخۆ بچێتە شیتەکەت.
+              </div>
+            </div>
+          </div>
+          <button
+            onClick={() => setShowSettingsModal(true)}
+            className="px-4 py-2 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold rounded-xl transition shadow-xs shrink-0"
+          >
+            بەستنەوە لە ماوەی ١ خولەکدا
+          </button>
+        </div>
+      )}
+
       {/* Summary Stat Cards */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 my-6 print:hidden">
-        
-        {/* Total Card */}
         <div className="bg-white p-4 sm:p-5 rounded-2xl border border-slate-200 shadow-xs flex items-center justify-between">
           <div>
             <span className="text-xs font-semibold text-slate-500 block">کۆی تۆمارەکان</span>
@@ -276,7 +444,6 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           </div>
         </div>
 
-        {/* New Card */}
         <div className="bg-white p-4 sm:p-5 rounded-2xl border border-blue-200 shadow-xs flex items-center justify-between">
           <div>
             <span className="text-xs font-semibold text-blue-700 block">تۆمارە نوێکان</span>
@@ -289,7 +456,6 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           </div>
         </div>
 
-        {/* Approved Card */}
         <div className="bg-white p-4 sm:p-5 rounded-2xl border border-emerald-200 shadow-xs flex items-center justify-between">
           <div>
             <span className="text-xs font-semibold text-emerald-700 block">پەسەندکراوەکان</span>
@@ -302,7 +468,6 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           </div>
         </div>
 
-        {/* Rejected Card */}
         <div className="bg-white p-4 sm:p-5 rounded-2xl border border-red-200 shadow-xs flex items-center justify-between">
           <div>
             <span className="text-xs font-semibold text-red-700 block">ڕەتکراوەکان</span>
@@ -314,29 +479,19 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             <XCircle className="w-6 h-6" />
           </div>
         </div>
-
-      </div>
-
-      {/* Print-only Header */}
-      <div className="hidden print:block mb-6 text-center border-b-2 border-slate-900 pb-4">
-        <h2 className="text-xl font-bold">زانکۆی پۆلیتەکنیکی هەولێر • پەیمانگەی تەکنیکی کارگێڕی</h2>
-        <h3 className="text-lg font-semibold mt-1">بەشی سیستمی زانیاری کارگێڕی (MIS) - لیستی تۆمارکراوان</h3>
-        <p className="text-xs text-slate-600 mt-1">
-          بەرواری چاپ: {new Date().toLocaleDateString('ku-IQ')} | کۆی تۆمارەکان: {totalCount}
-        </p>
       </div>
 
       {/* Filter and Search Bar */}
-      <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-xs mb-6 space-y-4 print:hidden">
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+      <div className="bg-white p-4 sm:p-5 rounded-2xl border border-slate-200 shadow-xs mb-6 space-y-4 print:hidden">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
           
-          {/* Search Box */}
-          <div className="lg:col-span-2 relative">
+          {/* Search Input */}
+          <div className="relative">
             <input
               type="text"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="گەڕان لە تۆمارەکان... (ناو، ئیمەیل، مۆبایل، کۆد)"
+              placeholder="گەڕان بەپێی ناو، مۆبایل، ئیمەیڵ، کۆد..."
               className="w-full py-2.5 px-3 pr-10 rounded-xl text-xs sm:text-sm border border-slate-300 focus:border-slate-800 outline-none transition"
             />
             <div className="absolute right-3 top-3 text-slate-400 pointer-events-none">
@@ -421,8 +576,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 setLimit(Number(e.target.value));
                 setPage(1);
               }}
-              className="py-1 px-2 rounded-lg border border-slate-200 text-xs bg-slate-50"
+              className="py-1 px-2 border border-slate-200 rounded-lg text-xs bg-white font-medium"
             >
+              <option value={15}>15</option>
               <option value={25}>25</option>
               <option value={50}>50</option>
               <option value={100}>100</option>
@@ -431,12 +587,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         </div>
       </div>
 
-      {/* Registrations Table Card */}
-      <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden print:border-none print:shadow-none">
+      {/* Main Registrations Table */}
+      <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
         <div className="overflow-x-auto">
-          <table className="w-full text-right text-xs sm:text-sm divide-y divide-slate-200">
-            <thead className="bg-slate-900 text-white font-semibold">
-              <tr>
+          <table className="w-full text-right text-xs sm:text-sm border-collapse">
+            <thead>
+              <tr className="bg-slate-900 text-white font-semibold border-b border-slate-800">
                 <th className="py-3.5 px-4">کۆدی تۆمارکردن</th>
                 <th className="py-3.5 px-4">ناوی سیانی</th>
                 <th className="py-3.5 px-4">ژمارەی مۆبایل</th>
@@ -444,7 +600,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 <th className="py-3.5 px-4">ئیمەیلی تایبەتی</th>
                 <th className="py-3.5 px-4">قۆناغ</th>
                 <th className="py-3.5 px-4">بار</th>
-                <th className="py-3.5 px-4">بەروار</th>
+                <th className="py-3.5 px-4">Google Sheet</th>
                 <th className="py-3.5 px-4 text-center print:hidden">کردارەکان</th>
               </tr>
             </thead>
@@ -501,8 +657,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     <td className="py-3.5 px-4">
                       {renderStatusBadge(r.status)}
                     </td>
-                    <td className="py-3.5 px-4 font-mono text-[11px] text-slate-500 whitespace-nowrap" dir="ltr">
-                      {r.created_at}
+                    <td className="py-3.5 px-4">
+                      {r.synced_to_sheet ? (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
+                          <Check className="w-3 h-3 text-emerald-600" />
+                          <span>هاوکاتە</span>
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-slate-100 text-slate-600">
+                          لە مۆبایل/وێب
+                        </span>
+                      )}
                     </td>
                     <td className="py-3.5 px-4 print:hidden">
                       <div className="flex items-center justify-center gap-1.5">
@@ -549,8 +714,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           </table>
         </div>
 
-        {/* Pagination Controls */}
-        <div className="p-4 bg-slate-50 border-t border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs text-slate-600 print:hidden">
+        {/* Pagination Footer */}
+        <div className="p-4 border-t border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs text-slate-600 print:hidden">
           <div>
             پەڕەی <span className="font-bold text-slate-900">{page}</span> لە کۆی{' '}
             <span className="font-bold text-slate-900">{totalPages}</span>
@@ -559,47 +724,45 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           <div className="flex items-center gap-1">
             <button
               onClick={() => setPage((p) => Math.max(1, p - 1))}
-              disabled={page <= 1 || loading}
-              className="px-3 py-1.5 rounded-lg bg-white border border-slate-200 hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed font-medium flex items-center gap-1 transition"
+              disabled={page <= 1}
+              className="p-1.5 rounded-lg border border-slate-200 hover:bg-slate-50 disabled:opacity-40 disabled:pointer-events-none transition"
             >
-              <ChevronRight className="w-3.5 h-3.5" />
-              <span>پێشووتر</span>
+              <ChevronRight className="w-4 h-4" />
             </button>
 
-            {Array.from({ length: Math.min(5, totalPages) }, (_, idx) => {
-              let pageNum = idx + 1;
-              if (totalPages > 5 && page > 3) {
-                pageNum = page - 3 + idx;
-                if (pageNum > totalPages) pageNum = totalPages - (4 - idx);
-              }
-              return (
-                <button
-                  key={pageNum}
-                  onClick={() => setPage(pageNum)}
-                  className={`w-8 h-8 rounded-lg font-bold transition ${
-                    page === pageNum
-                      ? 'bg-slate-900 text-white'
-                      : 'bg-white border border-slate-200 hover:bg-slate-100 text-slate-700'
-                  }`}
-                >
-                  {pageNum}
-                </button>
-              );
-            })}
+            {Array.from({ length: totalPages }, (_, i) => i + 1)
+              .filter((p) => p === 1 || p === totalPages || Math.abs(p - page) <= 1)
+              .map((p, idx, arr) => (
+                <React.Fragment key={p}>
+                  {idx > 0 && arr[idx - 1] !== p - 1 && (
+                    <span className="px-1 text-slate-400">...</span>
+                  )}
+                  <button
+                    onClick={() => setPage(p)}
+                    className={`min-w-[28px] h-7 px-2 rounded-lg font-bold text-xs transition ${
+                      page === p
+                        ? 'bg-slate-900 text-white'
+                        : 'border border-slate-200 hover:bg-slate-50 text-slate-700'
+                    }`}
+                  >
+                    {p}
+                  </button>
+                </React.Fragment>
+              ))}
 
             <button
               onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-              disabled={page >= totalPages || loading}
-              className="px-3 py-1.5 rounded-lg bg-white border border-slate-200 hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed font-medium flex items-center gap-1 transition"
+              disabled={page >= totalPages}
+              className="p-1.5 rounded-lg border border-slate-200 hover:bg-slate-50 disabled:opacity-40 disabled:pointer-events-none transition"
             >
-              <span>دواتر</span>
-              <ChevronLeft className="w-3.5 h-3.5" />
+              <ChevronLeft className="w-4 h-4" />
             </button>
           </div>
         </div>
+
       </div>
 
-      {/* Modals */}
+      {/* Viewing Record Modal */}
       {viewingRecord && (
         <ViewRecordModal
           record={viewingRecord}
@@ -611,6 +774,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         />
       )}
 
+      {/* Editing Record Modal */}
       {editingRecord && (
         <EditRecordModal
           record={editingRecord}
@@ -618,134 +782,25 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           onClose={() => setEditingRecord(null)}
           onSaveSuccess={(updated) => {
             setRecords((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
+            setEditingRecord(null);
             fetchRegistrations();
           }}
         />
       )}
 
+      {/* Admin Settings Modal */}
       {showSettingsModal && (
         <AdminSettingsModal
           currentSettings={appSettings}
           adminToken={adminToken}
-          onClose={() => setShowSettingsModal(false)}
           onSaveSuccess={(updated) => {
             onUpdateAppSettings(updated);
+            setShowSettingsModal(false);
           }}
+          onClose={() => setShowSettingsModal(false)}
         />
       )}
 
-      {showPasswordModal && (
-        <ChangePasswordModal adminToken={adminToken} onClose={() => setShowPasswordModal(false)} />
-      )}
-
-    </div>
-  );
-};
-
-// Modal to change admin password securely
-const ChangePasswordModal: React.FC<{ adminToken: string; onClose: () => void }> = ({ adminToken, onClose }) => {
-  const [currentPassword, setCurrentPassword] = useState('');
-  const [newPassword, setNewPassword] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [statusMsg, setStatusMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
-
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setLoading(true);
-    setStatusMsg(null);
-
-    try {
-      const response = await fetch('/api/admin/change-password', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${adminToken}`,
-        },
-        credentials: 'include',
-        body: JSON.stringify({ currentPassword, newPassword }),
-      });
-
-      const data = await response.json();
-      if (!response.ok) {
-        setStatusMsg({ type: 'error', text: data.error || 'هەڵە لە گۆڕینی وشەی نهێنی.' });
-        setLoading(false);
-        return;
-      }
-
-      setStatusMsg({ type: 'success', text: 'وشەی نهێنی بە سەرکەوتوویی نوێکرایەوە.' });
-      setTimeout(() => {
-        onClose();
-      }, 1200);
-    } catch (err) {
-      setStatusMsg({ type: 'error', text: 'پەیوەندی لەگەڵ سێرڤەر سەرکەوتوو نەبوو.' });
-      setLoading(false);
-    }
-  };
-
-  return (
-    <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
-      <div className="bg-white rounded-2xl max-w-md w-full shadow-2xl border border-slate-200 overflow-hidden text-right">
-        <div className="bg-slate-900 text-white p-4 flex items-center justify-between border-b-2 border-amber-500">
-          <h3 className="font-bold text-sm">گۆڕینی وشەی نهێنی بەڕێوەبەر</h3>
-          <button onClick={onClose} className="text-slate-400 hover:text-white">
-            <XCircle className="w-5 h-5" />
-          </button>
-        </div>
-
-        {statusMsg && (
-          <div
-            className={`p-3 text-xs font-semibold ${
-              statusMsg.type === 'success' ? 'bg-emerald-50 text-emerald-800' : 'bg-red-50 text-red-800'
-            }`}
-          >
-            {statusMsg.text}
-          </div>
-        )}
-
-        <form onSubmit={handleSubmit} className="p-6 space-y-4">
-          <div className="space-y-1">
-            <label className="block text-xs font-bold text-slate-700">وشەی نهێنی ئێستا</label>
-            <input
-              type="password"
-              dir="ltr"
-              required
-              value={currentPassword}
-              onChange={(e) => setCurrentPassword(e.target.value)}
-              className="w-full py-2 px-3 text-left rounded-xl border border-slate-300 text-sm focus:border-slate-800 outline-none"
-            />
-          </div>
-
-          <div className="space-y-1">
-            <label className="block text-xs font-bold text-slate-700">وشەی نهێنی نوێ (بەلایەنی کەم ٦ پیت/ژمارە)</label>
-            <input
-              type="password"
-              dir="ltr"
-              required
-              minLength={6}
-              value={newPassword}
-              onChange={(e) => setNewPassword(e.target.value)}
-              className="w-full py-2 px-3 text-left rounded-xl border border-slate-300 text-sm focus:border-slate-800 outline-none"
-            />
-          </div>
-
-          <div className="pt-2 flex items-center justify-end gap-2">
-            <button
-              type="button"
-              onClick={onClose}
-              className="px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-xl"
-            >
-              هەڵوەشاندنەوە
-            </button>
-            <button
-              type="submit"
-              disabled={loading}
-              className="px-5 py-2 text-xs font-bold bg-slate-900 text-white rounded-xl hover:bg-slate-800 shadow-sm"
-            >
-              پاشەکەوتکردن
-            </button>
-          </div>
-        </form>
-      </div>
     </div>
   );
 };

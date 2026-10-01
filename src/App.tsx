@@ -6,26 +6,31 @@ import { ClosedNotice } from './components/ClosedNotice';
 import { AdminLogin } from './components/AdminLogin';
 import { AdminDashboard } from './components/AdminDashboard';
 import type { Registration, AppSettings } from './types';
+import { getLocalSettings, saveLocalSettings } from './services/storageService';
 
 export default function App() {
   const [currentView, setCurrentView] = useState<'student' | 'admin'>(() => {
     if (typeof window !== 'undefined') {
-      if (window.location.pathname === '/admin' || window.location.hash === '#admin') {
+      if (
+        window.location.pathname === '/admin' ||
+        window.location.pathname.endsWith('/admin') ||
+        window.location.hash === '#admin'
+      ) {
         return 'admin';
       }
     }
     return 'student';
   });
 
-  const [settings, setSettings] = useState<AppSettings>({
-    isRegistrationOpen: true,
-    academicLevel: 'قۆناغی سێیەم',
-    registrationTitle: 'خۆتۆمارکردنی قوتابیان بۆ سمستەری سێیەم',
-    instructionText: 'تکایە زانیارییەکان بە وردی و دروستی پڕبکەرەوە، پاشان فۆرمەکە بنێرە.',
-  });
+  const [settings, setSettings] = useState<AppSettings>(() => getLocalSettings());
 
   const [submittedRegistration, setSubmittedRegistration] = useState<Registration | null>(null);
-  const [adminEmail, setAdminEmail] = useState<string | null>(null);
+  const [adminEmail, setAdminEmail] = useState<string | null>(() => {
+    if (typeof window !== 'undefined') {
+      return localStorage.getItem('epu_admin_email');
+    }
+    return null;
+  });
   const [adminToken, setAdminToken] = useState<string | null>(() => {
     if (typeof window !== 'undefined') {
       return localStorage.getItem('epu_admin_token');
@@ -37,7 +42,11 @@ export default function App() {
   // Sync route and load initial settings & session
   useEffect(() => {
     const handlePopState = () => {
-      if (window.location.pathname === '/admin' || window.location.hash === '#admin') {
+      if (
+        window.location.pathname === '/admin' ||
+        window.location.pathname.endsWith('/admin') ||
+        window.location.hash === '#admin'
+      ) {
         setCurrentView('admin');
       } else {
         setCurrentView('student');
@@ -47,44 +56,63 @@ export default function App() {
     window.addEventListener('popstate', handlePopState);
     window.addEventListener('hashchange', handlePopState);
 
-    // Fetch settings
+    // Fetch settings from server if available
     fetch('/api/settings')
       .then((res) => res.json())
       .then((data) => {
         if (data && typeof data.isRegistrationOpen === 'boolean') {
-          setSettings(data);
+          setSettings((prev) => {
+            const merged = { ...prev, ...data };
+            saveLocalSettings(merged);
+            return merged;
+          });
         }
       })
-      .catch((err) => console.error('Error fetching settings:', err));
+      .catch(() => {});
 
     // Check if admin is already logged in
     const storedToken = typeof window !== 'undefined' ? localStorage.getItem('epu_admin_token') : null;
-    const headers: Record<string, string> = {};
-    if (storedToken) {
-      headers['Authorization'] = `Bearer ${storedToken}`;
+    const storedEmail = typeof window !== 'undefined' ? localStorage.getItem('epu_admin_email') : null;
+
+    if (storedToken && storedToken.startsWith('epu_admin_static_')) {
+      setAdminToken(storedToken);
+      setAdminEmail(storedEmail || 'admin@epu.edu.iq');
+      setLoadingInitial(false);
+      return;
     }
 
-    fetch('/api/admin/me', { headers, credentials: 'include' })
-      .then((res) => {
-        if (res.ok) return res.json();
-        return null;
-      })
-      .then((data) => {
-        if (data?.authenticated) {
-          setAdminEmail(data.email);
-        } else {
-          // Only clear if token was invalid
-          if (storedToken) {
+    if (storedToken) {
+      const headers: Record<string, string> = {
+        'Authorization': `Bearer ${storedToken}`,
+      };
+
+      fetch('/api/admin/me', { headers, credentials: 'include' })
+        .then((res) => {
+          if (res.ok) return res.json();
+          return null;
+        })
+        .then((data) => {
+          if (data?.authenticated) {
+            setAdminEmail(data.email);
+          } else {
             localStorage.removeItem('epu_admin_token');
+            localStorage.removeItem('epu_admin_email');
             setAdminToken(null);
             setAdminEmail(null);
           }
-        }
-      })
-      .catch(() => {})
-      .finally(() => {
-        setLoadingInitial(false);
-      });
+        })
+        .catch(() => {
+          // If server down but user had valid token, keep email for offline convenience
+          if (storedEmail) {
+            setAdminEmail(storedEmail);
+          }
+        })
+        .finally(() => {
+          setLoadingInitial(false);
+        });
+    } else {
+      setLoadingInitial(false);
+    }
 
     return () => {
       window.removeEventListener('popstate', handlePopState);
@@ -95,9 +123,9 @@ export default function App() {
   const handleNavigate = (view: 'student' | 'admin') => {
     setCurrentView(view);
     if (view === 'admin') {
-      window.history.pushState(null, '', '/admin');
+      window.history.pushState(null, '', '#admin');
     } else {
-      window.history.pushState(null, '', '/');
+      window.history.pushState(null, '', window.location.pathname.replace(/#.*$/, ''));
     }
   };
 
@@ -106,6 +134,7 @@ export default function App() {
     setAdminToken(token);
     if (typeof window !== 'undefined') {
       localStorage.setItem('epu_admin_token', token);
+      localStorage.setItem('epu_admin_email', email);
     }
   };
 
@@ -117,12 +146,13 @@ export default function App() {
       }
       await fetch('/api/admin/logout', { method: 'POST', headers, credentials: 'include' });
     } catch (e) {
-      console.error(e);
+      // offline
     }
     setAdminEmail(null);
     setAdminToken(null);
     if (typeof window !== 'undefined') {
       localStorage.removeItem('epu_admin_token');
+      localStorage.removeItem('epu_admin_email');
     }
   };
 
@@ -182,7 +212,7 @@ export default function App() {
             بەشی سیستمی زانیاری کارگێڕی (Department of Management Information Systems)
           </div>
           <p className="text-slate-400 text-[11px] pt-1">
-            سیستەمی ئەلیکترۆنی خۆتۆمارکردنی قوتابیان بۆ وەرزی خوێندنی ٢٠٢٥ - ٢٠٢٦
+            سیستەمی ئەلیکترۆنی خۆتۆمارکردنی قوتابیان بۆ وەرزی خوێندنی <span dir="ltr" className="font-mono">2026 - 2027</span>
           </p>
         </div>
       </footer>

@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
-import { User, Phone, Mail, AtSign, Award, Hash, AlertCircle, Send, CheckCircle2, FileText } from 'lucide-react';
+import { User, Phone, Mail, AtSign, AlertCircle, Send, CheckCircle2, KeyRound } from 'lucide-react';
 import type { Registration, AppSettings } from '../types';
+import { submitRegistration } from '../services/storageService';
 
 interface StudentRegistrationFormProps {
   settings: AppSettings;
@@ -65,10 +66,6 @@ export const StudentRegistrationForm: React.FC<StudentRegistrationFormProps> = (
       newErrors.personal_email = 'تکایە ئیمەیڵێکی دروست بنووسە.';
     }
 
-    if (!formData.academic_level) {
-      newErrors.academic_level = 'تکایە ئەم خانەیە پڕبکەرەوە.';
-    }
-
     setErrors(newErrors);
     return Object.keys(newErrors).length === 0;
   };
@@ -102,31 +99,17 @@ export const StudentRegistrationForm: React.FC<StudentRegistrationFormProps> = (
     setErrors({});
 
     try {
-      const response = await fetch('/api/register', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(formData),
-      });
+      const result = await submitRegistration(formData);
 
-      const data = await response.json();
-
-      if (!response.ok) {
-        if (response.status === 409) {
-          // Duplicate university email
+      if (!result.success) {
+        if (result.field === 'university_email') {
           setErrors({
-            university_email: 'ئەم ئیمەیڵە پێشتر تۆمار کراوە.',
-            general: 'ئەم ئیمەیڵە پێشتر تۆمار کراوە. تکایە دڵنیابەرەوە لە ئیمەیڵەکەت.',
-          });
-        } else if (data.field) {
-          setErrors({
-            [data.field]: data.error || 'تکایە ئەم خانەیە بە دروستی پڕبکەرەوە.',
-            general: data.error,
+            university_email: result.error || 'ئەم ئیمەیڵە پێشتر تۆمار کراوە.',
+            general: result.error,
           });
         } else {
           setErrors({
-            general: data.error || 'هەڵەیەک لە ناردنی فۆرم ڕوویدا.',
+            general: result.error || 'هەڵەیەک لە ناردنی فۆرم ڕوویدا.',
           });
         }
         setIsSubmitting(false);
@@ -134,13 +117,13 @@ export const StudentRegistrationForm: React.FC<StudentRegistrationFormProps> = (
       }
 
       // Success
-      if (data.registration) {
-        onSuccess(data.registration);
+      if (result.registration) {
+        onSuccess(result.registration);
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error('Submission error:', err);
       setErrors({
-        general: 'پەیوەندی لەگەڵ سێرڤەر پچڕا. تکایە دووبارە هەوڵبدەرەوە.',
+        general: 'هەڵەیەک ڕوویدا لە کاتی ناردنی فۆرم. تکایە دووبارە هەوڵبدەرەوە.',
       });
       setIsSubmitting(false);
     }
@@ -154,7 +137,7 @@ export const StudentRegistrationForm: React.FC<StudentRegistrationFormProps> = (
         {/* Header Ribbon */}
         <div className="bg-gradient-to-r from-slate-900 via-slate-800 to-slate-900 p-6 sm:p-8 text-white text-center border-b-2 border-amber-500">
           <span className="inline-block px-3 py-1 bg-amber-500/20 text-amber-300 rounded-full text-xs font-semibold mb-3 border border-amber-400/30">
-            ساڵی خوێندنی ٢٠٢٥ - ٢٠٢٦
+            ساڵی خوێندنی <span dir="ltr" className="font-mono">2026 - 2027</span>
           </span>
           <h1 className="text-xl sm:text-2xl font-extrabold text-white leading-tight">
             {settings.registrationTitle || 'خۆتۆمارکردنی قوتابیان بۆ سمستەری سێیەم'}
@@ -299,7 +282,7 @@ export const StudentRegistrationForm: React.FC<StudentRegistrationFormProps> = (
                     className="w-full py-2.5 px-3 pr-9 rounded-xl border border-slate-300 text-xs sm:text-sm focus:border-slate-800 focus:ring-2 focus:ring-slate-200 outline-none"
                   />
                   <div className="absolute right-3 top-3 text-slate-400 pointer-events-none">
-                    <FileText className="w-4 h-4" />
+                    <KeyRound className="w-4 h-4" />
                   </div>
                 </div>
               </div>
@@ -356,69 +339,8 @@ export const StudentRegistrationForm: React.FC<StudentRegistrationFormProps> = (
                     className="w-full py-2.5 px-3 pr-9 rounded-xl border border-slate-300 text-xs sm:text-sm focus:border-slate-800 focus:ring-2 focus:ring-slate-200 outline-none"
                   />
                   <div className="absolute right-3 top-3 text-slate-400 pointer-events-none">
-                    <FileText className="w-4 h-4" />
+                    <KeyRound className="w-4 h-4" />
                   </div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Academic Level & Optional Student ID */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-5">
-            {/* 5. Academic Level */}
-            <div className="space-y-1.5">
-              <label htmlFor="academic_level" className="block text-sm font-bold text-slate-800">
-                قۆناغ <span className="text-red-500 font-bold">*</span>
-              </label>
-              <div className="relative">
-                <select
-                  id="academic_level"
-                  name="academic_level"
-                  value={formData.academic_level}
-                  onChange={handleChange}
-                  disabled={isSubmitting}
-                  className={`w-full py-3 px-4 pr-11 rounded-xl text-sm sm:text-base border transition-colors outline-none bg-white ${
-                    errors.academic_level
-                      ? 'border-red-400 bg-red-50/40 focus:border-red-500 focus:ring-2 focus:ring-red-200'
-                      : 'border-slate-300 focus:border-slate-800 focus:ring-2 focus:ring-slate-200'
-                  }`}
-                >
-                  <option value="قۆناغی سێیەم">قۆناغی سێیەم (Third Semester)</option>
-                  <option value="قۆناغی چوارەم">قۆناغی چوارەم (Fourth Semester)</option>
-                  <option value="قۆناغی دووەم">قۆناغی دووەم (Second Semester)</option>
-                  <option value="قۆناغی یەکەم">قۆناغی یەکەم (First Semester)</option>
-                </select>
-                <div className="absolute right-3.5 top-3.5 text-slate-400 pointer-events-none">
-                  <Award className="w-5 h-5" />
-                </div>
-              </div>
-              {errors.academic_level && (
-                <p className="text-xs text-red-600 font-medium flex items-center gap-1 mt-1">
-                  <AlertCircle className="w-3.5 h-3.5" />
-                  <span>{errors.academic_level}</span>
-                </p>
-              )}
-            </div>
-
-            {/* Optional Student ID */}
-            <div className="space-y-1.5">
-              <label htmlFor="student_id" className="block text-sm font-semibold text-slate-700">
-                ژمارەی قوتابی <span className="text-xs text-slate-400 font-normal">(ئارەزوومەندانە / Optional)</span>
-              </label>
-              <div className="relative">
-                <input
-                  id="student_id"
-                  name="student_id"
-                  type="text"
-                  dir="ltr"
-                  value={formData.student_id}
-                  onChange={handleChange}
-                  placeholder="2024XXXX"
-                  disabled={isSubmitting}
-                  className="w-full py-3 px-4 pr-11 text-left font-mono rounded-xl text-sm sm:text-base border border-slate-300 bg-white focus:border-slate-800 focus:ring-2 focus:ring-slate-200 transition-colors outline-none"
-                />
-                <div className="absolute right-3.5 top-3.5 text-slate-400 pointer-events-none">
-                  <Hash className="w-5 h-5" />
                 </div>
               </div>
             </div>
