@@ -11,7 +11,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   isRegistrationOpen: true,
   academicLevel: 'قۆناغی سێیەم',
   registrationTitle: APP_CONFIG.DEFAULT_TITLE || 'خۆتۆمارکردنی قوتابیان بۆ سمستەری سێیەم',
-  instructionText: 'تکایە زانیارییەکان بە وردی و دروستی پڕبکەرەوە، پاشان فۆرمەکە بنێرە. دوای ناردن زانیارییەکان ڕاستەوخۆ دەچنە Google Sheets.',
+  instructionText: 'تکایە زانیارییەکان بە وردی و دروستی پڕبکەرەوە، پاشان فۆرمەکە بنێرە.',
   googleSheetScriptUrl: APP_CONFIG.GOOGLE_SHEET_SCRIPT_URL || '',
   googleSheetViewUrl: '',
   adminPassword: 'admin123456',
@@ -65,9 +65,18 @@ export function getLocalSettings(): AppSettings {
         ? parsed.googleSheetScriptUrl
         : APP_CONFIG.GOOGLE_SHEET_SCRIPT_URL;
 
+    let instructionText = parsed.instructionText || DEFAULT_SETTINGS.instructionText;
+    if (instructionText && instructionText.includes('Google Sheets')) {
+      instructionText = instructionText
+        .replace('دوای ناردن زانیارییەکان ڕاستەوخۆ دەچنە Google Sheets.', '')
+        .replace('دوای ناردن زانیارییەکان ڕاستەوخۆ دەچنە Google Sheets', '')
+        .trim();
+    }
+
     return {
       ...DEFAULT_SETTINGS,
       ...parsed,
+      instructionText: instructionText || DEFAULT_SETTINGS.instructionText,
       googleSheetScriptUrl: effectiveSheetUrl,
     };
   } catch (e) {
