@@ -1,6 +1,7 @@
 import type { Registration, AppSettings, DashboardStats } from '../types';
 import * as XLSX from 'xlsx';
 import { sendRegistrationToGoogleSheets } from './googleSheetsService';
+import { APP_CONFIG } from '../config';
 
 const SETTINGS_KEY = 'epu_mis_app_settings';
 const REGISTRATIONS_KEY = 'epu_mis_all_registrations';
@@ -9,9 +10,9 @@ const ADMIN_SESSION_KEY = 'epu_admin_session';
 export const DEFAULT_SETTINGS: AppSettings = {
   isRegistrationOpen: true,
   academicLevel: 'قۆناغی سێیەم',
-  registrationTitle: 'خۆتۆمارکردنی قوتابیان بۆ سمستەری سێیەم',
+  registrationTitle: APP_CONFIG.DEFAULT_TITLE || 'خۆتۆمارکردنی قوتابیان بۆ سمستەری سێیەم',
   instructionText: 'تکایە زانیارییەکان بە وردی و دروستی پڕبکەرەوە، پاشان فۆرمەکە بنێرە. دوای ناردن زانیارییەکان ڕاستەوخۆ دەچنە Google Sheets.',
-  googleSheetScriptUrl: '',
+  googleSheetScriptUrl: APP_CONFIG.GOOGLE_SHEET_SCRIPT_URL || '',
   googleSheetViewUrl: '',
   adminPassword: 'admin123456',
 };
@@ -58,7 +59,17 @@ export function getLocalSettings(): AppSettings {
       localStorage.setItem(SETTINGS_KEY, JSON.stringify(DEFAULT_SETTINGS));
       return DEFAULT_SETTINGS;
     }
-    return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+    const parsed = JSON.parse(raw);
+    const effectiveSheetUrl =
+      (parsed.googleSheetScriptUrl && parsed.googleSheetScriptUrl.trim().length > 10)
+        ? parsed.googleSheetScriptUrl
+        : APP_CONFIG.GOOGLE_SHEET_SCRIPT_URL;
+
+    return {
+      ...DEFAULT_SETTINGS,
+      ...parsed,
+      googleSheetScriptUrl: effectiveSheetUrl,
+    };
   } catch (e) {
     return DEFAULT_SETTINGS;
   }
@@ -176,9 +187,10 @@ export async function submitRegistration(input: RegisterInput): Promise<{
   };
 
   // 1. Dispatch to Google Sheets if configured
-  if (settings.googleSheetScriptUrl && settings.googleSheetScriptUrl.trim().length > 10) {
+  const effectiveSheetUrl = settings.googleSheetScriptUrl || APP_CONFIG.GOOGLE_SHEET_SCRIPT_URL;
+  if (effectiveSheetUrl && effectiveSheetUrl.trim().length > 10) {
     try {
-      const res = await sendRegistrationToGoogleSheets(newRecord, settings.googleSheetScriptUrl);
+      const res = await sendRegistrationToGoogleSheets(newRecord, effectiveSheetUrl);
       if (res.success) {
         newRecord.synced_to_sheet = true;
       }
